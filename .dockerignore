@@ -1,0 +1,9 @@
+.git
+.github
+.gitlab-ci.yml
+data.sqlite*
+signing-key.pem
+node_modules
+*.md
+Dockerfile
+.dockerignore
