@@ -419,11 +419,16 @@ function choose(title, message, options) {
   });
 }
 
+// Shown above every button that runs Argon2id (passwordKeys), which can take many seconds on slow devices.
+const SLOW_KEYS_NOTE = `<div class="notice warn">This can take a while (up to a minute on slower devices) because this
+  page is generating the keys that secure your account. Keep this page open.</div>`;
+
 // Ask for an existing password; resolves with check(password). The read-only username helps password managers.
 function askPassword(title, message, name, check) {
   return formSheet(title, message, `
     <input type="hidden" name="username" autocomplete="username" value="${esc(name)}">
-    <label class="field">Password<input type="password" name="password" autocomplete="current-password" required></label>`,
+    <label class="field">Password<input type="password" name="password" autocomplete="current-password" required></label>
+    ${SLOW_KEYS_NOTE}`,
     'Continue', (form) => check(form.password.value));
 }
 
@@ -441,7 +446,7 @@ const newPasswordFields = (name = '') => `
 
 // Ask for a username + new password; checks them, then resolves with submit(name, password).
 function askNewPassword(title, message, name, submit) {
-  const done = formSheet(title, message, newPasswordFields(name), 'Save', async (form) => {
+  const done = formSheet(title, message, newPasswordFields(name) + SLOW_KEYS_NOTE, 'Save', async (form) => {
     const user = form.username.value.trim().toLowerCase(), password = form.password.value;
     const problem = passwordProblem(password, user);
     if (problem) throw new Error(problem);
@@ -488,6 +493,7 @@ function viewSignIn(request, support) {
       <label class="field">Username<input name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
       <label class="field">Password<input type="password" name="password" autocomplete="current-password" required></label>
       <div class="error" role="alert" id="pwErr"></div>
+      ${SLOW_KEYS_NOTE}
       <button class="btn ${support === false ? '' : 'ghost'}">Sign in with password</button>
     </form>
     <button class="btn ghost" data-act="pwcreate">Create an identity with a password</button>`;
