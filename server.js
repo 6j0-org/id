@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
+import { promisify } from 'node:util';
 import { newChallenge, verifyRegistration, verifyAssertion, WebAuthnError } from './webauthn.js';
 import { db } from './db.js';
 import { jwks, signToken } from './tokens.js';
@@ -74,6 +75,82 @@ function tx(fn) {
   catch (e) { db.exec('ROLLBACK'); throw e; }
 }
 
+// ---------- passwords ----------
+// The browser never sends the password (see public/id.js): it sends authKey = HKDF(Argon2id(password, salt, kdf)),
+// which we hash again with scrypt. The key that unwraps the root secret is a different HKDF output and stays in the
+// browser. Anyone with the database can still guess passwords offline, which is why the page insists on strong ones.
+
+const scryptAsync = promisify(scrypt);
+const SCRYPT = { N: 16384, r: 8, p: 1 };
+// Argon2id cost for new passwords (RFC 9106's second recommended option, with one lane), and the floor we accept.
+// Stored per password, so it can be raised later without breaking existing ones. Keep in sync with public/id.js.
+const KDF = { alg: 'argon2id', m: 65536, t: 3, p: 1 }; // m in KiB: 64 MiB
+const USERNAME_RE = /^[a-z0-9][a-z0-9._-]{2,31}$/;
+
+function username(v) {
+  const u = String(v ?? '').trim().toLowerCase();
+  if (!USERNAME_RE.test(u)) throw new HttpError(400, 'Usernames are 3–32 letters, numbers, dots, dashes or underscores, starting with a letter or number.');
+  return u;
+}
+function bytes64(v, field, length) {
+  if (typeof v !== 'string' || !/^[A-Za-z0-9_-]+$/.test(v) || Buffer.from(v, 'base64url').length !== length) throw new HttpError(400, `Bad ${field}`);
+  return v;
+}
+function kdf(v) {
+  const ok = v && v.alg === 'argon2id' && Object.keys(v).length === 4
+    && Number.isInteger(v.m) && v.m >= KDF.m && v.m <= 1048576    // up to 1 GiB
+    && Number.isInteger(v.t) && v.t >= KDF.t && v.t <= 20
+    && Number.isInteger(v.p) && v.p >= 1 && v.p <= 4;
+  if (!ok) throw new HttpError(400, 'Bad kdf');
+  return JSON.stringify({ alg: v.alg, m: v.m, t: v.t, p: v.p });
+}
+
+async function hashAuthKey(authKey) {
+  const salt = randomBytes(16);
+  const hash = await scryptAsync(Buffer.from(authKey, 'base64url'), salt, 32, SCRYPT);
+  return `scrypt$${SCRYPT.N}$${SCRYPT.r}$${SCRYPT.p}$${salt.toString('base64url')}$${hash.toString('base64url')}`;
+}
+async function checkAuthKey(authKey, stored) {
+  const [, N, r, p, salt, hash] = stored.split('$');
+  const got = await scryptAsync(Buffer.from(authKey, 'base64url'), Buffer.from(salt, 'base64url'), 32, { N: +N, r: +r, p: +p });
+  return timingSafeEqual(got, Buffer.from(hash, 'base64url'));
+}
+// Checked against for unknown usernames, so they take as long as wrong passwords.
+const DUMMY_HASH = await hashAuthKey(randomBytes(32).toString('base64url'));
+
+// Unknown usernames get a stable fake salt, so /prelogin doesn't reveal which usernames exist.
+const fakeSaltKey = q("SELECT value FROM meta WHERE key = 'fake_salt_key'").get()?.value || (() => {
+  const v = randomBytes(32).toString('base64url');
+  q("INSERT INTO meta (key, value) VALUES ('fake_salt_key', ?)").run(v);
+  return v;
+})();
+const fakeSalt = (name) => createHmac('sha256', fakeSaltKey).update(name).digest().subarray(0, 16).toString('base64url');
+
+// Fixed-window rate limits, in memory (one replica, like the passkey challenges).
+const attempts = new Map(); // key -> { n, reset }
+const LIMIT_WINDOW_MS = 15 * 60 * 1000;
+function limit(key, max) {
+  const now = Date.now();
+  if (attempts.size > 10000) for (const [k, v] of attempts) if (v.reset < now) attempts.delete(k);
+  let a = attempts.get(key);
+  if (!a || a.reset < now) attempts.set(key, a = { n: 0, reset: now + LIMIT_WINDOW_MS });
+  if (++a.n > max) throw new HttpError(429, 'Too many attempts. Wait 15 minutes and try again.');
+}
+// Behind a reverse proxy, set TRUST_PROXY=1 so limits apply per client rather than to the proxy.
+const clientIp = (req) => (process.env.TRUST_PROXY && String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()) || req.socket.remoteAddress;
+
+// The validated fields shared by register and set/change password.
+const passwordFields = (body) => ({
+  username: username(body.username),
+  salt: bytes64(body.salt, 'salt', 16),
+  kdf: kdf(body.kdf),
+  authKey: bytes64(body.authKey, 'auth key', 32),
+  wrappedRoot: sealed(body.wrappedRoot, 'wrapped root'),
+});
+const taken = (name, exceptUserId = 0) => Boolean(q('SELECT 1 FROM passwords WHERE username = ? AND user_id != ?').get(name, exceptUserId));
+const signInMethods = (userId) => q('SELECT COUNT(*) n FROM passkeys WHERE user_id = ?').get(userId).n
+  + q('SELECT COUNT(*) n FROM passwords WHERE user_id = ?').get(userId).n;
+
 const publicUser = (u) => ({ guid: u.guid });
 const userEntity = (guid) => ({ id: Buffer.from(guid).toString('base64url'), name: `6j0.org ${guid.slice(0, 8)}`, displayName: '6j0.org identity' });
 
@@ -141,13 +218,81 @@ route('POST', '/api/passkey/add/verify', async ({ req, user, body, res }) => {
   send(res, 200, { ok: true });
 });
 
+// Create an identity with a username + password instead of a passkey.
+route('POST', '/api/password/register', async ({ req, body, res }) => {
+  limit(`register:${clientIp(req)}`, 20);
+  const f = passwordFields(body);
+  if (taken(f.username)) throw new HttpError(409, 'That username is taken. Try another one.');
+  const authHash = await hashAuthKey(f.authKey);
+  const userId = tx(() => {
+    const { lastInsertRowid } = q('INSERT INTO users (guid) VALUES (?)').run(randomUUID());
+    q(`INSERT INTO passwords (user_id, username, salt, kdf, auth_hash, wrapped_root, last_used_at)
+       VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`).run(lastInsertRowid, f.username, f.salt, f.kdf, authHash, f.wrappedRoot);
+    return lastInsertRowid;
+  });
+  send(res, 200, { user: publicUser(q('SELECT * FROM users WHERE id = ?').get(userId)) }, newSession(userId));
+}, { auth: false });
+
+// Step 1 of password sign-in: the Argon2id salt and cost for a username (fake but stable ones if it doesn't exist).
+route('POST', '/api/password/prelogin', async ({ req, body, res }) => {
+  limit(`prelogin:${clientIp(req)}`, 200);
+  const name = username(body.username);
+  const pw = q('SELECT salt, kdf FROM passwords WHERE username = ?').get(name);
+  send(res, 200, pw ? { salt: pw.salt, kdf: JSON.parse(pw.kdf) } : { salt: fakeSalt(name), kdf: KDF });
+}, { auth: false });
+
+// Step 2: check authKey. Unknown username and wrong password get the same answer.
+route('POST', '/api/password/login', async ({ req, body, res }) => {
+  const name = username(body.username);
+  limit(`login-ip:${clientIp(req)}`, 50);
+  limit(`login-user:${name}`, 10);
+  const authKey = bytes64(body.authKey, 'auth key', 32);
+  const pw = q('SELECT * FROM passwords WHERE username = ?').get(name);
+  const ok = await checkAuthKey(authKey, pw?.auth_hash || DUMMY_HASH);
+  if (!pw || !ok) throw new HttpError(401, 'Wrong username or password.');
+  q(`UPDATE passwords SET last_used_at = datetime('now') WHERE id = ?`).run(pw.id);
+  const user = q('SELECT * FROM users WHERE id = ?').get(pw.user_id);
+  send(res, 200, { user: publicUser(user), wrappedRoot: pw.wrapped_root }, newSession(user.id));
+}, { auth: false });
+
+// My password, if any: what the page needs to unlock the root secret with it (and to show the username).
+route('GET', '/api/password', async ({ user, res }) => {
+  const pw = q('SELECT username, salt, kdf, wrapped_root, created_at, last_used_at FROM passwords WHERE user_id = ?').get(user.id);
+  send(res, 200, { password: pw ? { username: pw.username, salt: pw.salt, kdf: JSON.parse(pw.kdf), wrappedRoot: pw.wrapped_root,
+    created_at: pw.created_at, last_used_at: pw.last_used_at } : null });
+});
+
+// Set a password, or change it. Changing needs proof of the current one (currentAuthKey), so a stolen session
+// can't lock the owner out of their password.
+route('PUT', '/api/password', async ({ req, user, body, res }) => {
+  const f = passwordFields(body);
+  const current = q('SELECT * FROM passwords WHERE user_id = ?').get(user.id);
+  if (current) {
+    limit(`login-user:${current.username}`, 10);
+    if (!await checkAuthKey(bytes64(body.currentAuthKey, 'current auth key', 32), current.auth_hash)) throw new HttpError(403, 'Your current password is wrong.');
+  }
+  if (taken(f.username, user.id)) throw new HttpError(409, 'That username is taken. Try another one.');
+  const authHash = await hashAuthKey(f.authKey);
+  q(`INSERT INTO passwords (user_id, username, salt, kdf, auth_hash, wrapped_root) VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT (user_id) DO UPDATE SET username = excluded.username, salt = excluded.salt, kdf = excluded.kdf,
+       auth_hash = excluded.auth_hash, wrapped_root = excluded.wrapped_root, created_at = datetime('now')`)
+    .run(user.id, f.username, f.salt, f.kdf, authHash, f.wrappedRoot);
+  send(res, 200, { ok: true });
+});
+
+route('DELETE', '/api/password', async ({ user, res }) => {
+  if (!q('SELECT 1 FROM passkeys WHERE user_id = ?').get(user.id))
+    throw new HttpError(409, "Your password is your only way to sign in. Add a passkey before removing it, or you'll lose your identity and every app's data.");
+  q('DELETE FROM passwords WHERE user_id = ?').run(user.id);
+  send(res, 200, { ok: true });
+});
+
 route('GET', '/api/passkeys', async ({ user, res }) => {
   send(res, 200, q('SELECT id, created_at, last_used_at FROM passkeys WHERE user_id = ? ORDER BY id').all(user.id));
 });
 
 route('DELETE', '/api/passkeys/:id', async ({ user, params, res }) => {
-  const n = q('SELECT COUNT(*) n FROM passkeys WHERE user_id = ?').get(user.id).n;
-  if (n <= 1) throw new HttpError(409, "That's your only passkey. Add another one before removing it, or you'll lose your identity and every app's data.");
+  if (signInMethods(user.id) <= 1) throw new HttpError(409, "That's your only way to sign in. Add another passkey or a password before removing it, or you'll lose your identity and every app's data.");
   const r = q('DELETE FROM passkeys WHERE id = ? AND user_id = ?').run(params.id, user.id);
   if (!r.changes) throw new HttpError(404, 'Passkey not found');
   send(res, 200, { ok: true });
@@ -187,6 +332,9 @@ route('GET', '/healthz', async ({ res }) => send(res, 200, { ok: true }), { auth
 const STATIC = {
   '/': 'index.html', '/index.html': 'index.html', '/authorize': 'index.html', '/id.js': 'id.js', '/style.css': 'style.css',
 };
+// Vendored @noble/hashes (Argon2id for the password fallback). Pinned; see README "Vendored code".
+const NOBLE = 'vendor/noble-hashes-2.4.0';
+for (const f of ['argon2.js', 'blake2.js', '_blake.js', '_md.js', '_u64.js', 'utils.js']) STATIC[`/${NOBLE}/${f}`] = `${NOBLE}/${f}`;
 const MIME = { html: 'text/html; charset=utf-8', js: 'text/javascript; charset=utf-8', css: 'text/css; charset=utf-8' };
 
 // This page holds every identity's root secret while it's open: same-origin scripts only, no framing.

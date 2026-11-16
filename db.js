@@ -6,7 +6,7 @@ db.exec(`
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
--- An identity has no name, email or password: just a random GUID, authenticated by passkeys.
+-- An identity has no name or email: just a random GUID, authenticated by passkeys and/or one username + password.
 -- It is the "sub" every 6j0.org app sees for this person.
 CREATE TABLE IF NOT EXISTS users (
   id         INTEGER PRIMARY KEY,
@@ -26,6 +26,28 @@ CREATE TABLE IF NOT EXISTS passkeys (
   wrapped_root  TEXT NOT NULL,
   created_at    TEXT NOT NULL DEFAULT (datetime('now')),
   last_used_at  TEXT
+);
+
+-- At most one username + password per identity, for people whose passkey manager can't do PRF (see public/id.js).
+-- The browser never sends the password: it runs Argon2id(password, salt, kdf) itself and sends only auth_key, a
+-- separate HKDF output. auth_hash is scrypt(auth_key). wrapped_root is the root secret wrapped under another HKDF
+-- output of the same Argon2id result, which never leaves the browser. Usernames are private: only used to sign in.
+CREATE TABLE IF NOT EXISTS passwords (
+  id           INTEGER PRIMARY KEY,
+  user_id      INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  username     TEXT NOT NULL UNIQUE,                  -- lowercase
+  salt         TEXT NOT NULL,                         -- Argon2id salt, 16 bytes, base64url
+  kdf          TEXT NOT NULL,                         -- JSON Argon2id cost: {"alg":"argon2id","m":<KiB>,"t":<passes>,"p":<lanes>}
+  auth_hash    TEXT NOT NULL,                         -- scrypt$N$r$p$salt$hash
+  wrapped_root TEXT NOT NULL,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  last_used_at TEXT
+);
+
+-- Server-side secrets that must survive restarts (e.g. the key for fake salts of unknown usernames).
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
